@@ -68,15 +68,13 @@ pick_channel <- function(meta, preferred, fallback_pattern) {
   if (length(hit) > 0) {
     return(hit[1])
   }
-  
+  # prepare the description column for searching
   desc <- meta$desc
   desc[is.na(desc)] <- ""
-  
   hits <- meta$name[
     grepl(fallback_pattern, meta$name, ignore.case = TRUE) |
       grepl(fallback_pattern, desc, ignore.case = TRUE)
   ]
-  
   if (length(hits) == 0) {
     return(NA)
   }
@@ -85,9 +83,9 @@ pick_channel <- function(meta, preferred, fallback_pattern) {
 }
 
 # General channel finder
-
+# find other channels such as Time or Zombie NIR
 find_channel <- function(meta, pattern) {
-  
+  # search both the channel name and description 
   desc <- meta$desc
   desc[is.na(desc)] <- ""
   
@@ -103,31 +101,21 @@ find_channel <- function(meta, pattern) {
   hits[1]
 }
 
-
-# =========================
-# Your filter plot function
-# =========================
-
-
-
-# =========================
 # Main processing function
-# =========================
+# process one fcs file 
 
 process_fcs <- function(fcs_file) {
-  
+  # extract the sample name from the file name
   sample_name <- tools::file_path_sans_ext(basename(fcs_file))
+  # extract the cytometer folder name
   cytometer <- basename(dirname(fcs_file))
-  
+  # create a separate results folder for each sample
   sample_dir <- file.path("Preprocessing_results", cytometer, sample_name)
   dir.create(sample_dir, recursive = TRUE, showWarnings = FALSE)
   
   message("Processing: ", sample_name)
   
-  
-  # =========================
-  # 1. Read FCS file
-  # =========================
+  # Read FCS file
   
   fcs_data <- read.FCS(
     fcs_file,
@@ -139,49 +127,44 @@ process_fcs <- function(fcs_file) {
   # Add Original_ID before any preprocessing
   fcs_data <- add_original_id(fcs_data)
   
-  
-  # =========================
-  # 2. Metadata
-  # =========================
+  # extract Metadata
+  # missing descriptions are replaced with empty text
   
   meta <- fcs_data@parameters@data
   meta$desc[is.na(meta$desc)] <- ""
   
-  
-  # =========================
-  # 3. Detect channels
-  # =========================
-  
+  # Detect FSC, SSC, Time, and Zombie channels
+  # find the forward scatter area channel 
   fsc_a <- pick_channel(
     meta,
     preferred = c("FSC-A", "FSC51-A", "FSC53-A"),
     fallback_pattern = "FSC.*-A"
   )
-  
+  # find the foward scater hight channel 
   fsc_h <- pick_channel(
     meta,
     preferred = c("FSC-H", "FSC51-H", "FSC53-H"),
     fallback_pattern = "FSC.*-H"
   )
-  
+  # find the side scatter area channel
   ssc_a <- pick_channel(
     meta,
     preferred = c("SSC-A", "SSC52-A", "VSSC-A", "BSSC-A"),
     fallback_pattern = "SSC.*-A"
   )
+  # find the time and the viability channel 
   
   time_ch <- find_channel(meta, "^Time$|TIME|Time")
   zombie <- find_channel(meta, "Zombie|dead|LD|viability")
+  
+  # stop if any key channel is missing 
   
   if (any(is.na(c(fsc_a, fsc_h, ssc_a, time_ch, zombie)))) {
     stop(paste("Important channel missing in", sample_name))
   }
   
-  
-  # =========================
-  # 4. Detect markers of interest
-  # =========================
-  
+  # Detect markers of interest by searching the marker description
+
   marker_words <- c(
     "CD3", "CD4", "CD8", "CD11c", "CD14", "CD16", "CD19",
     "CD25", "CD27", "CD38", "CD39", "CD45RA", "CD56", "CD57",
@@ -194,64 +177,56 @@ process_fcs <- function(fcs_file) {
       grepl("-A$|Comp$", meta$name, ignore.case = TRUE)
   ]
   
-  # Include live/dead marker
+  # Include live/dead marker for transformation 
   markers <- unique(c(markers, zombie))
   
   if (length(markers) == 0) {
     stop(paste("No marker channels found in", sample_name))
   }
   
-  
-  # =========================
-  # 5. Remove margins
-  # =========================
+  # Remove margins
   
   ff_m <- PeacoQC::RemoveMargins(
     fcs_data,
     channels = markers,
-    remove_min = FALSE,
-    remove_max = TRUE
+    remove_min = NULL,
   )
   
-  
-  # =========================
-  # 6. Logicle transformation
-  # =========================
+  # Logicle transformation
   
   trans <- tryCatch(
     estimateLogicle(ff_m, channels = markers),
+    # if logicletransformation fails use arcsinh transformation 
     error = function(e) {
       message("Logicle failed for ", sample_name, ". Using arcsinh instead.")
       transformList(markers, arcsinhTransform(a = 0, b = 1/500, c = 0))
     }
   )
-  
+  #apply the transformation
   ff_t <- flowCore::transform(ff_m, trans)
   
-  
-  # =========================
   # 7. Linear transformation of SSC-A
   # using reference marker
-  # =========================
-  
+  # select a reference marker
   reference_marker <- meta$name[
     grepl("CD3", meta$desc, ignore.case = TRUE) &
       grepl("-A$|Comp$", meta$name, ignore.case = TRUE)
   ][1]
-  
+  # If CD3 is missing the script uses the first available marker
   if (is.na(reference_marker)) {
     reference_marker <- markers[1]
   }
-  
+  # Calculate the 5th and 95th percentile of the reference marker
   q5_goal <- quantile(exprs(ff_t)[, reference_marker], 0.05, na.rm = TRUE)
   q95_goal <- quantile(exprs(ff_t)[, reference_marker], 0.95, na.rm = TRUE)
-  
+  # calculate the 5th and 95th percentile of SSC-A.
   q5_ssc <- quantile(exprs(ff_t)[, ssc_a], 0.05, na.rm = TRUE)
   q95_ssc <- quantile(exprs(ff_t)[, ssc_a], 0.95, na.rm = TRUE)
-  
+  # calculate the slope
   ssc_a_slope <- (q95_goal - q5_goal) / (q95_ssc - q5_ssc)
+  # calculate the intercept 
   ssc_a_intercept <- q5_goal - q5_ssc * ssc_a_slope
-  
+  # apply linear transformation 
   trans <- c(
     trans,
     transformList(
@@ -263,24 +238,21 @@ process_fcs <- function(fcs_file) {
     )
   )
   
- 
-  
-  
-  # =========================
-  # 8. Density plots after transformation
-  # =========================
+  # create density plots after transformation for all markers of interest
   
   df <- as.data.frame(exprs(ff_t)[, markers, drop = FALSE])
+  # convert data into long format for ploting 
   df_long <- stack(df)
+  # use marker descriptions as plot labels
   df_long$desc <- meta$desc[match(df_long$ind, meta$name)]
   df_long$desc <- gsub("Spectral ", "", df_long$desc)
-  
+  # create the density plot for all transformed markers 
   p_density <- ggplot(df_long, aes(x = values)) +
     geom_density(fill = "blue", alpha = 0.4) +
     facet_wrap(~ desc, scales = "free") +
     theme_minimal() +
     theme(strip.text = element_text(size = 7))
-  
+  # save the density plot in the result folder 
   ggsave(
     file.path(sample_dir, "density_plots.png"),
     p_density,
@@ -288,21 +260,15 @@ process_fcs <- function(fcs_file) {
     height = 10
   )
   
-  
-  # =========================
-  # 9. Remove doublets
-  # =========================
-  
+  # Remove doublets
+
   ff_s <- PeacoQC::RemoveDoublets(
     ff_t,
     channel1 = fsc_a,
     channel2 = fsc_h
   )
   
-  
-  # =========================
-  # 10. Live/dead gating
-  # =========================
+  # Live/dead gating using cytoexploreR 
   
   message("Draw live/dead gate for: ", sample_name)
   
@@ -314,14 +280,13 @@ process_fcs <- function(fcs_file) {
     display = 50000,
     axes_limits = "data"
   )
-  
+  # extract the drawn gate
   live_gate <- gate_list$Live
+  # apply the gate and keep only live cells.
   live_filter <- flowCore::filter(ff_s, live_gate)
   ff_l <- ff_s[live_filter@subSet, ]
   
-  
-  # =========================
-  # 11. PeacoQC
+  # PeacoQC quality control on the live cells 
   
   PQC <- PeacoQC::PeacoQC(
     ff = ff_l,
@@ -331,19 +296,17 @@ process_fcs <- function(fcs_file) {
     save_fcs = FALSE,
     output_directory = sample_dir
   )
-  
+  # extract the final cleaned flowFrame
   ff_qc <- PQC$FinalFF
   
-  # 12. Create population plots
-
-  
+  # Create population plots
+# make a random selection of FSC-A channel for easy ploting  
   set.seed(123)
-  
   fcs_data_filtered <- fcs_data[
     exprs(fcs_data)[, fsc_a] <
       quantile(exprs(fcs_data)[, fsc_a], 0.995, na.rm = TRUE),
   ]
-  # create function for filter plot 
+  # create a filter ploting function 
   filter_plot <- function(ff_pre, ff_post, title, channel_x, channel_y) {
     
     df <- data.frame(
@@ -370,7 +333,7 @@ process_fcs <- function(fcs_file) {
     
     return(p)
   }
-  
+  # this shows margin removal 
   p1 <- filter_plot(
     fcs_data_filtered,
     ff_m,
@@ -378,7 +341,7 @@ process_fcs <- function(fcs_file) {
     fsc_a,
     ssc_a
   )
-  
+  # this shows doublet removal 
   p2 <- filter_plot(
     ff_t,
     ff_s,
@@ -386,7 +349,7 @@ process_fcs <- function(fcs_file) {
     fsc_a,
     fsc_h
   )
-  
+  #this shows live/dead gating 
   p3 <- filter_plot(
     ff_s,
     ff_l,
@@ -394,7 +357,7 @@ process_fcs <- function(fcs_file) {
     fsc_a,
     zombie
   )
-  
+  # this shows peacoQC filtering 
   p4 <- filter_plot(
     ff_l,
     ff_qc,
@@ -402,12 +365,12 @@ process_fcs <- function(fcs_file) {
     time_ch,
     fsc_a
   )
-  
+  # combine all four plots as one row 
   combined <- ggpubr::ggarrange(
     p1, p2, p3, p4,
     nrow = 1
   )
-  
+  # save to result folder 
   ggsave(
     file.path(sample_dir, "population_plots.png"),
     combined,
@@ -415,15 +378,13 @@ process_fcs <- function(fcs_file) {
     height = 6
   )
   
-  # 13. Save cleaned FCS
-  
+  # save the final cleaned fcs file 
   write.FCS(
     ff_qc,
     filename = file.path(sample_dir, paste0(sample_name, "_cleaned.fcs"))
   )
   
-  # 14. Save summary
-  
+  # create and save summary table for the sample 
   summary <- data.frame(
     Sample = sample_name,
     Cytometer = cytometer,
@@ -448,20 +409,19 @@ process_fcs <- function(fcs_file) {
   return(summary)
 }
 
-# Run all FCS files
-
+# run the pre processing function on all fcs files 
 all_results <- list()
 
 for (file in fcs_files) {
   all_results[[file]] <- process_fcs(file)
 }
-
+# combine all sample summaries into one table 
 final_summary <- do.call(rbind, all_results)
-
+# save the final summary table for all samples 
 write.csv(
   final_summary,
   "Preprocessing_results/final_summary.csv",
   row.names = FALSE
 )
-
+# display the final summary
 final_summary
