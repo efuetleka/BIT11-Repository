@@ -179,6 +179,3 @@ for (plot in to_plot) {
 }
 # prints all plots on same row 
 print(ggpubr::ggarrange(plotlist = plot_list, nrow = 1))
-# use CytoExploreR 
-# have a look at flowDensity
-# do a density plot for the markers after transformation
